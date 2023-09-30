@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+
+from typing import List, Any, Dict
+
+import os
+import re
+import socket
+import sys
+import subprocess
+from subprocess import CompletedProcess
+
+import yaml
+
+class PSS(str):
+    pass
+
+import yaml
+
+class literal(str):
+    pass
+
+def literal_presenter(dumper, data):
+    if data.startswith('|'):
+        data = data.replace('|', '\n')
+        return dumper.represent_scalar('tag:yaml.org,2002:str', data, style="|")
+    return dumper.represent_scalar('tag:yaml.org,2002:str', data)
+
+# python yaml has a bug that prevents strings starting with `|`
+# to be represented as multi line strings
+# This code fixes that
+yaml.add_representer(literal, literal_presenter)
+yaml.representer.SafeRepresenter.add_representer(str, literal_presenter)
+
+
+class Cpu(object):
+    FLAGS = {
+        'fpu': 'fpu (floating-point unit on-chip)',
+        'vme': 'vme (virtual mode extension)',
+        'de': 'de (debugging extension)',
+        'pse': 'pse (page size extension)',
+        'tsc': 'tsc (time stamp counter)',
+        'msr': 'msr (model specific registers)',
+        'pae': 'pae (physical address extension)',
+        'mce': 'mce (machine check exception)',
+        'cx8': 'cx8 (cmpxchg8 instruction supported)',
+        'apic': 'apic (on-chip apic hardware supported)',
+        'sep': 'sep (fast system call)',
+        'mtrr': 'mtrr (memory type range registers)',
+        'pge': 'pge (page global enable)',
+        'mca': 'mca (machine check architecture)',
+        'cmov': 'cmov (conditional move instruction supported)',
+        'pat': 'pat (page attribute table)',
+        'pse36': 'pse-36 (36-bit page size extension)',
+        'clflush': 'clfsh (clflush instruction supported)',
+        'dts': 'ds (debug store)',
+        'acpi': 'acpi (acpi supported)',
+        'mmx': 'mmx (mmx technology supported)',
+        'fxsr': 'fxsr (fxsave and fxstor instructions supported)',
+        'sse': 'sse (streaming simd extensions)',
+        'sse2': 'sse2 (streaming simd extensions 2)',
+        'ss': 'ss (self-snoop)',
+        'ht': 'htt (multi-threading)',
+        'tm': 'tm (thermal monitor supported)',
+        'pbe': 'pbe (pending break enabled)'
+    }
+
+    
+    def __init__(self) -> None:
+        self.id: int = -1
+        self.manufacturer: str = None
+        self.vendor_model_family: str = None
+        self.vendor_model_version: str  =None
+        self.vendor_subcategory_model: str = None
+        self.number_of_cores: int = 0
+        self.vendor_model_stepping: int = -1
+        self.number_of_siblings: int = -1
+        self.vendor_microcode_version: str = None
+        self.virtualization_enabled: bool = False
+        self.virtualization_type: str = None
+        self.virtualization_flags: List[str] = []
+        self.bogomips: float = 0
+        # (buffer size to flsush one line from cpu cache to main memory using CFLUSH instruction)
+        self.clflush_size: int = 0 
+        # Align datastructures to be of multiples of  clflush_size to improve mem access
+        # misaligned datastructures cause more cache misses 
+        self.cache_alignment: int = 0
+        self.address_size_physical: int = 0
+        self.address_size_virtual: int = 0
+        # If the "wp" flag is present, it might indicate that the Write Protect Bit 
+        # is supported by the processor. This bit is used in the page tables to mark 
+        # certain pages of memory as read-only, preventing unintentional or unauthorized
+        # writes to those pages.
+        self.write_protect_bit_enabled: bool = False
+        self.x87_floating_pint_unit_enabled: bool = False
+        self.floating_pint_unit_enabled: bool = False
+
+        self.flags: List[str] = []
+        self.cores: List[dict[str, List[str]]]
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.cache_summary: List[str] = []
+        self.vulnerabilities: Dict[str, str] = {}
+        self.characteristics: List[str] = {}
+        self.operations_modes: List[str] = []
+        self.cpus: Dict[str, str]
+        self.frequencies: Dict[str, str] = {}
+        self.numa: Dict[str, str] = {}
+
+    @property
+    def info(self):
+        return {
+            'id': self.id,
+            'Operation mode(s)': self.operations_modes,
+            'bogomips': self.bogomips,
+            'clflush_size (bytes)': self.clflush_size,
+            'cache_alignment (bytes)': self.cache_alignment,
+            'write protect bit enabled': self.write_protect_bit_enabled,
+            
+            'floating point unit': {
+                'enabled': self.floating_pint_unit_enabled,
+                'Legacy x87 FPU support': self.x87_floating_pint_unit_enabled
+            },
+            'address_sizes':{
+                'physical (bits)': self.address_size_physical,
+                'virtual (bits)': self.address_size_virtual
+            },
+            'vendor': {
+                'manufacturer': self.manufacturer,
+                'microcode': self.vendor_microcode_version,
+                'model': {
+                    'version': self.vendor_model_version,
+                    'subcategory':{
+                        'family': self.vendor_model_family,
+                        'model': self.vendor_subcategory_model,
+                        'stepping (version)': self.vendor_model_stepping,
+                    },
+                },
+                'cores': {
+                    'number': self.number_of_cores,
+                    'threads per core': self.number_of_siblings // self.number_of_cores,
+                    'mapping': self.cores,
+                    
+                },
+                'cpus': self.cpus,
+                'frequencies': self.frequencies,
+                'cache': {
+                    'detailed': self.cache,
+                    'summary': self.cache_summary
+                },
+                'threads': {
+                    'number': self.number_of_siblings,
+                    'hyper threading': True if self.number_of_siblings > self.number_of_cores else False
+                },
+                'flags': [self.FLAGS.get(flag, flag) for flag in self.flags]
+            },
+            'virtualization': {
+                'type': self.virtualization_type,
+                'enabled': self.virtualization_enabled,
+                'flags': self.virtualization_flags 
+            },
+            'vulnerabilities': self.vulnerabilities,
+            'characteristics': self.characteristics,
+            'numa': self.numa
+        }
+
+class Cpus(object):
+    def __init__(self) -> None:
+        self._index: int = 0
+        self._cpus: List[Cpu] = []
+
+        cpuinfo: CompletedProcess = subprocess.run(
+            "cat /proc/cpuinfo",
+            capture_output=True,
+            shell=True
+        )
+
+        coresinfo: List[bytes] = cpuinfo.stdout.split(b'\n\n')
+        
+        self._cpus = self.__parse_coresinfo(coresinfo)
+    
+    def __parse_coresinfo(self, coresinfo: List[bytes]) -> List[Cpu]:
+        cpus: Dict[int, Cpu] = dict()
+
+        for coreinfo in coresinfo:
+            cpu: Cpu = Cpu()
+
+            if not coreinfo:
+                continue
+
+            coreinfo: str = coreinfo.decode()           
+            
+            cpu.id = self.__get_cpu_id(coreinfo)
+            cpu.vendor_model_family = self.__get_vendor_model_family(coreinfo)
+            cpu.vendor_subcategory_model = self.__get_vendor_subcategory_model(coreinfo)
+            cpu.vendor_model_version = self.__get_vendor_model_version(coreinfo)
+            cpu.number_of_cores = self.__get_number_of_cores(coreinfo)
+            cpu.vendor_model_stepping = self.__get_vendor_model_stepping(coreinfo)
+            cpu.number_of_siblings = self.__get_number_of_siblings(coreinfo)
+            cpu.vendor_microcode_version = self.__get_vendor_microcode_version(coreinfo)
+            cpu.bogomips = self.__get_bogomips(coreinfo)
+            cpu.clflush_size = self.__get_clflush_size(coreinfo)
+
+            cpu.cache_alignment = self.__get_cache_alignment(coreinfo)
+            cpu.address_size_physical, cpu.address_size_virtual = self.__get_address_sizes(coreinfo)
+            cpu.write_protect_bit_enabled = self.__get_write_protect_bit_enabled(coreinfo)
+            cpu.floating_pint_unit_enabled = self.__get_floating_point_unit_enabled(coreinfo)
+            cpu.x87_floating_pint_unit_enabled = self.__get_x87_floating_pint_unit_enabled(coreinfo)
+            cpu.flags = self.__get_flags(coreinfo)
+            cpu.manufacturer = self.__get_manufacturer_details(coreinfo)
+            cpu.virtualization_enabled = self.__get_virtualization_enabled(cpu.flags)
+            cpu.virtualization_type = self.__get_virtualization_type(cpu.flags)
+            cpu.virtualization_flags = self.__get_virtualization_flags(coreinfo)
+           
+            
+            core_name: str = self.__get_core_name(coreinfo)
+            core_id: str = self.__get_core_id(coreinfo)
+
+            if cpu.id  not in cpus:
+                cpu.cores = [{'core': core_id, 'cpus': [core_name]}]
+                cpus[cpu.id] = cpu
+            else:
+                cpu = cpus[cpu.id]
+                items: List = [item['core'] for item in cpu.cores]
+                try:
+                    idx: int = items.index(core_id)
+                    cpu.cores[idx]['cpus'].append(core_name)
+                except ValueError:
+                    cpu.cores.append(
+                        {'core': core_id, 'cpus': [core_name]}
+                    )
+            cpu.cache = self.__calculate_cpu_caches(cpu.cores)
+            cpu.cache_summary = self.__calculate_cpu_cache_summary(cpu.cache)
+            cpu.vulnerabilities = self.__parse_vulnerabilities()
+            cpu.characteristics = self.__get_characteristics(cpu)
+            cpu.operations_modes = self.__get_operation_modes(cpu)
+            cpu.cpus = self.__get_cpus_info(cpu)
+            
+        for cpu_id in cpus:
+            cpus[cpu_id].frequencies = self.__get_cpu_frequencies(cpus[cpu_id])
+            cpus[cpu_id].numa = self.__get_cpu_numa_info(cpus[cpu_id])
+        
+        return list(cpus.values())
+            
+    def __get_cpu_id(self, coreinfo: str) -> int:
+        return int(re.findall(r'physical id\s+:\s+(\d+)', coreinfo)[0])
+    
+    def __get_vendor_model_family(self, coreinfo: str) -> str:
+        return re.findall(r'cpu family\s+:\s+(.*)', coreinfo)[0]
+
+    def __get_vendor_subcategory_model(self, coreinfo: str) -> str:
+        return re.findall(r'model\s+:\s+(.*)', coreinfo)[0]
+
+    def __get_vendor_model_version(self, coreinfo: str) -> str:
+        return re.findall(r'model name\s+:\s+(.*)', coreinfo)[0]
+    
+    def __get_number_of_cores(self, coreinfo: str) -> int:
+        return int(re.findall(r'cpu cores\s+:\s+(\d+)', coreinfo)[0])
+    
+    def __get_core_name(self, coreinfo: str) -> str:
+        """
+        cpu{0-n}
+        """
+        processor_number: str = re.findall(r'processor\s+:\s+(\d+)', coreinfo)[0]
+        return f'cpu{processor_number}'
+    
+    def __get_core_id(self, coreinfo: str) -> int:
+        return int(re.findall(r'core id\s+:\s+(\d+)', coreinfo)[0])
+    
+    def __get_vendor_model_stepping(self, coreinfo: str) -> int:
+        return int(re.findall(r'stepping\s+:\s+(\d+)', coreinfo)[0])
+
+    def __get_number_of_siblings(self, coreinfo: str) -> int:
+        return int(re.findall(r'siblings\s+:\s+(\d+)', coreinfo)[0])
+    
+    def __get_vendor_microcode_version(self, coreinfo: str) -> str:
+        return re.findall(r'microcode\s+:\s+(.*)', coreinfo)[0]
+    
+    def __get_bogomips(self, coreinfo: str) -> float:
+        return float(re.findall(r'bogomips\s+:\s+(\d+.\d+)', coreinfo)[0])
+
+    def __get_clflush_size(self, coreinfo: str) -> int:
+        """
+        (buffer size to flsush one line from cpu cache to main memory using CFLUSH instruction)
+        """
+        return int(re.findall(r'clflush size\s+:\s+(\d+)', coreinfo)[0])
+    
+    def __get_cache_alignment(self, coreinfo: str) -> int:
+        return int(re.findall(r'cache_alignment\s+:\s+(\d+)', coreinfo)[0])
+    
+    def __get_address_sizes(self, coreinfo: str) -> tuple:
+        addresses : List[str] = re.findall(r'address sizes\s+:\s+(\d+).*\s+(\d+)', coreinfo)[0]
+        physical_addr_size: int = int(addresses[0])
+        virtual_addr_size: int = int(addresses[1])
+        return physical_addr_size, virtual_addr_size
+    
+    def __get_write_protect_bit_enabled(self, coreinfo: str) -> bool:
+        return re.findall(r'wp\s+:\s+(.*)', coreinfo)[0] == 'yes'
+    
+    def __get_floating_point_unit_enabled(self, coreinfo: str) -> bool:
+        return re.findall(r'fpu\s+:\s+(.*)', coreinfo)[0] == 'yes'
+    
+    def __get_x87_floating_pint_unit_enabled(self, coreinfo: str) -> bool:
+        fpu_exception: List[str] = re.findall(r'fpu_exception\s+:\s+(.*)', coreinfo)
+        return fpu_exception and fpu_exception[0] == 'yes'
+
+    def __get_virtualization_enabled(self, flags: List[str]) -> bool:
+        return 'vmx' in flags or 'svm' in flags
+    
+    def __get_virtualization_type(self, flags: List[str]) -> str:
+        if 'vmx' in flags:
+            return 'VT-x'
+        elif 'svm' in flags:
+            return 'AMD-V'
+        else:
+            return 'UNKNOWN'
+    
+    def __get_virtualization_flags(self, coreinfo: str) -> List[str]:
+        vmx_flags: List[str] = re.findall(r'vmx flags\s+:\s+(.*)', coreinfo)
+        svm_flags: List[str] = re.findall(r'svm flags\s+:\s+(.*)', coreinfo)
+        
+        if vmx_flags:
+            return vmx_flags[0].split()
+        elif svm_flags:
+            return svm_flags[0].split()
+
+    def __get_flags(self, coreinfo: str) -> List[str]:
+        return re.findall(r'flags\s+:\s+(.*)', coreinfo)[0].split()
+    
+    def __get_manufacturer_details(self, coreinfo: str) -> str:
+        manufacturer: str = re.findall(r'vendor_id\s+:\s+(.*)', coreinfo)[0]
+        match manufacturer:
+            case 'GenuineIntel':
+                return 'Intel(R) Corporation'
+            case 'AuthenticAMD':
+                return 'AMD, Inc.'
+            case _:
+                return manufacturer
+    
+    def __calculate_cpu_caches(self, cores) -> Dict:
+        """
+        Aggregate cpu internal caches across all cores
+        """
+        cache = dict()
+
+        for core_info in cores:
+            cpus: List[str] = core_info['cpus']
+            for cpu in cpus:
+                path_prefix : str  = f"/sys/devices/system/cpu/{cpu}"
+                dirs : List[str] = os.listdir(f'{path_prefix}/cache')
+                for dir in dirs:
+                    if not dir.startswith('index'):
+                        continue
+
+                    level: str = None
+                    size: str = None
+                    type: str = None
+                    id: str = None
+                    
+                    with open(f'{path_prefix}/cache/{dir}/id') as f:
+                        id: str = f.read().strip()
+
+                    with open(f'{path_prefix}/cache/{dir}/level') as f:
+                        level: str = f.read().strip()
+                        
+                    
+                    with open(f'{path_prefix}/cache/{dir}/size') as f:
+                        size: str = f.read().strip()
+                        
+            
+                    with open(f'{path_prefix}/cache/{dir}/type') as f:
+                        type: str = f.read().strip()
+                    
+                    with open(f'{path_prefix}/cache/{dir}/type') as f:
+                        type: str = f.read().strip()
+
+                    level: str = f'L{level}'
+
+                    if not level in cache:
+                        cache[level] = {}
+                    
+                    if not type in cache[level]:
+                        cache[level][type] = {}
+                                        
+                    cache[level][type][id] = size
+
+        return cache
+    
+    def __calculate_cpu_cache_summary(self, cache: dict[str, Any]) -> List[Dict[str, str]] :
+        summary: List[Dict[str, str]] = []
+
+        for level, data in cache.items():
+            new_level: str = None
+
+            for type, sizes in data.items():
+                count: str = f"{len(sizes)}"
+                if type == "Instruction":
+                    new_level = f"{level}i"
+                elif type == "Data":
+                    new_level = f"{level}d"
+                elif type == "Unified":
+                    new_level = f"{level}"
+                
+                size_int: int = 0
+                size_unit: str = 'KB'
+
+                for _, size in sizes.items():
+                    if 'K' in size:
+                        size_int += int(size.replace('K', ''))
+                
+                if size_int >= 1024:
+                    size_int = size_int // 1024
+                    size_unit = 'MB'
+                
+                new_level = new_level.ljust(4)
+                new_size: str = f'{size_int}'.ljust(4)
+                summary.append({
+                    new_level: f'{new_size} {size_unit} ({count} instances)'
+                })
+                
+        return summary
+
+    def __parse_vulnerabilities(self) -> Dict[str, str]:
+        vulnerabilities: Dict[str, str] = {'Known Vulnerabilities': {}, 'Currently Active': {}}
+        path: str = '/sys/devices/system/cpu/vulnerabilities'
+
+        vul_list: List[str] = os.listdir(path)
+        for vul_name in vul_list:
+            vul_file_path: str = os.path.join(path, vul_name)
+            key: str = vul_name.replace('_', ' ').capitalize()
+            with open(vul_file_path) as f:
+                data: str =  f.read().strip()
+                vulnerabilities['Known Vulnerabilities'][f'{key:25}'] = f'{data}'
+        
+        with open('/var/log/dmesg') as f:
+            kernel_msgs :str = f.readlines()
+
+            vulns : List[str] = [line[line.index(':')+2:].strip() for line in kernel_msgs if 'vuln' in line]
+
+            vulnerabilities['Currently Active'] = vulns
+
+        return vulnerabilities
+
+    def __get_characteristics(self, cpu: Cpu) -> List[str]:
+        charactersitics: List[str] = []
+        if 'lm' in cpu.flags:
+            charactersitics.append('64-bit capable')
+        
+        if len(cpu.cores) > 1:
+            charactersitics.append('Multi-Core')
+        
+        if cpu.number_of_siblings > cpu.number_of_cores:
+            charactersitics.append('Hardware Thread')
+        
+        if 'nx' in cpu.flags:
+            charactersitics.append('Execute Protection')
+
+        if 'vmx' in cpu.flags or 'svm' in cpu.flags:
+            charactersitics.append('Enhanced Virtualization')
+
+        cpu_freq_dirs: List[str] = [dir for dir in os.listdir('/sys/devices/system/cpu/cpufreq') if dir.startswith('policy')]
+        if cpu_freq_dirs:
+            charactersitics.append('Power/Performance Control')
+
+        return charactersitics
+
+    def __get_operation_modes(self, cpu: Cpu) -> List[str]:
+        if 'lm' in cpu.flags:
+            return ['32-bit', '64-bit']
+        else:
+            return ['32-bit']
+
+    def __get_cpus_info(self, cpu: Cpu):
+        return {
+            'count (no_cores * no_hw threads)': cpu.number_of_siblings,
+            'online': open('/sys/devices/system/cpu/online').read().strip()
+        }
+    
+    def __get_cpu_frequencies(self, cpu: Cpu) -> Dict[str, str]:
+        min: float = 0
+        max: float = 0
+        base: float = 0
+        count: int = 0
+
+        for core_data in cpu.cores:
+            for cpu in core_data['cpus']:
+                count += 1
+                cpu_id: str = cpu.replace('cpu', '')
+                path_prefix: str = f'/sys/devices/system/cpu/cpufreq/policy{cpu_id}'
+
+                with open(os.path.join(path_prefix, 'base_frequency')) as f:
+                    base += float(f.read().strip())
+                
+                with open(os.path.join(path_prefix, 'cpuinfo_max_freq')) as f:
+                    max += float(f.read().strip())
+                
+                with open(os.path.join(path_prefix, 'cpuinfo_min_freq')) as f:
+                    min += float(f.read().strip())
+        max /= (count * 1000000)
+        min /= (count * 1000000)
+        base /= (count * 1000000)
+
+        return {
+            'max': f'{max} GHZ',
+            'min': f'{min} GHZ',
+            'base': f'{base} GHZ',
+        }
+    
+    def __get_cpu_numa_info(self, cpu: Cpu) -> Dict[str, str]:
+        # Global numa info
+        nodes: Dict[str, Dict[str, Any]] = self.__get_numa_nodes_info(cpu)
+        
+        cpu_numa: Dict[str, str] = {'distances': []}
+
+        for core_data in cpu.cores:
+            core_id: str = 'core{}'.format(core_data['core'])
+            for cpu in core_data['cpus']:
+                cpu_id: str = cpu.replace('cpu', '')
+                for node, node_data in nodes.items():
+                    if node not in cpu_numa:
+                        cpu_numa[node] = {'memory': node_data['memory'], 'stat': node_data['stat'], 'cores': {}}
+                    if cpu_id in node_data['cpus']:
+                        if not core_id in cpu_numa[node]['cores']:
+                            cpu_numa[node]['cores'][core_id] = {'cpus': []}
+                        cpu_numa[node]['cores'][core_id]['cpus'].append(cpu)
+        
+        distances: List[List[str]] = self.__get_numa_distance_matrix(len(nodes))
+        node_names: List[str] = list(nodes.keys())
+        cpu_numa['distances'] = self.__get_numa_distance_string(node_names, distances)
+        return cpu_numa
+
+    def __get_numa_nodes_info(self, cpu: Cpu) -> Dict[str, Dict[str, Any]]:
+        nodes: Dict[str, Dict[str, Any]] = {}
+        path_prefix: str = '/sys/devices/system/node'
+        nodes_dirs: List[str] = [
+            dir for dir in os.listdir(path_prefix) if dir.startswith('node')
+        ]
+
+        for node_dir in nodes_dirs:
+            nodes[node_dir] = {
+                'cpus': [],
+                'memory': {'total': 0, 'free': 0, 'used': 0, 'unit': 'MB'},
+                'stat': {}
+            }
+
+            with open(os.path.join(path_prefix, node_dir, 'cpulist')) as f:
+                supported_cpus: str = f.read().strip()
+                if ',' in supported_cpus:
+                    nodes[node_dir].extend(supported_cpus.split(','))
+                elif '-' in supported_cpus:
+                    items: List[str] = supported_cpus.split('-')
+                    for i in range(int(items[0]), int(items[1]) + 1):
+                        nodes[node_dir]['cpus'].append(str(i))
+            
+            with open(os.path.join(path_prefix, node_dir, 'meminfo')) as f:
+
+                mem_total: str = f.readline().split(":")[1].replace('kB', '').strip()
+                mem_free: str = f.readline().split(":")[1].replace('kB', '').strip()
+                mem_used: str = f.readline().split(":")[1].replace('kB', '').strip()
+                nodes[node_dir]['memory']['total'] = int(mem_total) // 1024
+                nodes[node_dir]['memory']['free'] = int(mem_free) // 1024
+                nodes[node_dir]['memory']['used'] = int(mem_used) // 1024
+
+            with open(os.path.join(path_prefix, node_dir, 'numastat')) as f:
+                stats :str = f.readlines()
+                for line in stats:
+                    key, val = line.split(' ')
+                    nodes[node_dir]['stat'][key.strip()] = int(val.strip())
+            
+        return nodes
+
+
+    def __get_numa_distance_matrix(self, num_nodes) -> List[List[int]]:
+        distances = [[0] * num_nodes for _ in range(num_nodes)]
+        
+        for i in range(num_nodes):
+            for j in range(num_nodes):
+                distances[i][j] = self.__get_numa_distance_between_two_nodes(i, j)
+        return distances
+
+    def __get_numa_distance_between_two_nodes(self, node: str, anothernode: str) -> int:
+        distance_file = f"/sys/devices/system/node/node{node}/distance"
+        with open(distance_file, 'r') as file:
+            distances = [int(d) for d in file.readline().split()]
+        return distances[anothernode]
+    
+    def __get_numa_distance_string(self, numa_nodes: List[str], distances: List[List[str]]):
+        distance_string: str = """|"""
+
+        for i, node_name in enumerate(numa_nodes):
+            distances[i].insert(0, node_name)
+
+        numa_nodes_str = '   '.join(numa_nodes)
+        distance_string +=  f'      {numa_nodes_str}\n'
+            
+    
+        for row in distances:
+            row_str: str = '   '.join([str(d) for d in row])
+            distance_string += f'{row_str}\n'
+        
+        distance_string += "\n"
+
+        return distance_string
+
+
+    def __next__(self) -> Cpu:
+        try:
+            cpu: Cpu = self._cpus[self._index]
+            self._index += 1
+            return cpu
+        except IndexError:
+            raise StopIteration
+
+    def __iter__(self):
+        return self
+    
+    def __len__(self):
+        return len(self._cpus)
+
+class SystemInfo(object):
+    _hostname: str = None
+    _cpus: Cpus = None
+    _arch: str = None
+
+    @property
+    def hostname(self) -> str:
+        if self._hostname is None:
+            self._hostname = socket.gethostname()
+        return self._hostname
+
+    @property
+    def architecture(self) -> str:
+        if self._arch is None:
+            with open('/proc/sys/kernel/arch') as f:
+                self._arch = f.readline().strip()
+        return self._arch
+
+    @property
+    def byteorder(self) -> str:
+        return 'Little Endian' if sys.byteorder == 'little' else 'Big Endian'
+    
+    @property
+    def cpus(self) -> Cpus:
+        if not self._cpus:
+            self._cpus = Cpus()
+        return self._cpus
+    
+    @property
+    def data(self) -> Dict:
+        return {
+            'System Information': {
+                'Architecture': self.architecture,
+                'Byte Order': self.byteorder,
+                'Hostname': self.hostname,
+                'Sockets': len(self.cpus),
+                'Cpus': [cpu.info for cpu in self.cpus]
+
+            }
+        }
+
+    def pprint(self):
+        yaml.safe_dump(
+            self.data,
+            sys.stdout,
+            width=100,
+            allow_unicode=True,
+            default_flow_style=False,
+            sort_keys=False
+        )
+    
+    # Singleton
+    def __new__(cls) -> Any:
+        if not hasattr(cls, 'instance'):
+            cls.instance = super(SystemInfo, cls).__new__(cls)
+        return cls.instance
+    
+if __name__ == '__main__':
+    info: SystemInfo = SystemInfo()
+    info.pprint()
