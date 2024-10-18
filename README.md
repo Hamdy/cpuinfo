@@ -3,7 +3,6 @@
 A python tool to list cpu(s) information.
 
 [![asciicast](https://asciinema.org/a/FXa6HLpRjHbkSfxqykavedI0V.svg)](https://asciinema.org/a/FXa6HLpRjHbkSfxqykavedI0V)
-
 ## Features
 - No 3rd party tools required
 - Reads all information from virtual file systems `/proc` & `/sys`
